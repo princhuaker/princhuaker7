@@ -1,0 +1,993 @@
+import React, { useState, useEffect, createContext, useContext } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'firebase/auth';
+import { getFirestore, doc, getDoc, setDoc, collection, query, where, onSnapshot, addDoc, updateDoc, deleteDoc } from 'firebase/firestore';
+
+// Contexto de autenticación para compartir el estado de Firebase
+const AuthContext = createContext(null);
+
+const AuthProvider = ({ children }) => {
+    const [currentUser, setCurrentUser] = useState(null);
+    const [loadingAuth, setLoadingAuth] = useState(true);
+    const [authError, setAuthError] = useState(null);
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+
+    useEffect(() => {
+        try {
+            // Se obtiene la configuración de Firebase de una variable global
+            const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+
+            setDb(firestoreDb);
+            setAuth(firebaseAuth);
+
+            // Listener para los cambios en el estado de autenticación
+            const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                    // Si hay un usuario, se establece el usuario actual y el userId
+                    setCurrentUser(user);
+                    setUserId(user.uid);
+                } else {
+                    try {
+                        // Si no hay usuario, se intenta iniciar sesión con el token inicial
+                        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(firebaseAuth, initialAuthToken);
+                        } else {
+                            // Si no hay token, se inicia sesión de forma anónima
+                            await signInAnonymously(firebaseAuth);
+                        }
+                    } catch (error) {
+                        console.error("Error signing in:", error);
+                        setAuthError(error.message);
+                    }
+                }
+                setLoadingAuth(false); // Se finaliza el estado de carga
+            });
+
+            return () => unsubscribe(); // Limpiar el listener al desmontar el componente
+        } catch (error) {
+            console.error("Firebase initialization error:", error);
+            setAuthError(error.message);
+            setLoadingAuth(false);
+        }
+    }, []); // Se ejecuta una sola vez al montar el componente
+
+    // Función para cerrar sesión
+    const logout = async () => {
+        if (auth) {
+            try {
+                await signOut(auth);
+                setCurrentUser(null);
+                setUserId(null);
+            } catch (error) {
+                console.error("Error logging out:", error);
+                setAuthError(error.message);
+            }
+        }
+    };
+
+    return (
+        <AuthContext.Provider value={{ currentUser, userId, loadingAuth, authError, db, auth, logout }}>
+            {children}
+        </AuthContext.Provider>
+    );
+};
+
+// Componente para mostrar mensajes temporales en la aplicación
+const AppMessage = ({ message, type, onClose }) => {
+    if (!message) return null; // No renderizar si no hay mensaje
+    const bgColor = type === 'error' ? 'bg-red-500' : 'bg-green-500'; // Color de fondo según el tipo de mensaje
+    return (
+        <div className={`fixed bottom-4 left-1/2 -translate-x-1/2 p-3 rounded-lg shadow-lg text-white ${bgColor} z-50`}>
+            <span>{message}</span>
+            <button onClick={onClose} className="ml-4 font-bold">X</button> {/* Botón para cerrar el mensaje */}
+        </div>
+    );
+};
+
+// Hook personalizado para gestionar los mensajes de la aplicación
+const useAppMessage = () => {
+    const [message, setMessage] = useState('');
+    const [messageType, setMessageType] = useState('info');
+
+    const showMessage = (msg, type = 'info', duration = 3000) => {
+        setMessage(msg);
+        setMessageType(type);
+        setTimeout(() => setMessage(''), duration); // Ocultar el mensaje después de una duración
+    };
+
+    return { message, messageType, showMessage, clearMessage: () => setMessage('') };
+};
+
+// Componente del encabezado de la aplicación
+const Header = ({ title, onLogout }) => {
+    return (
+        <header className="bg-gradient-to-r from-blue-600 to-blue-800 p-4 text-white shadow-md flex justify-between items-center rounded-b-xl">
+            <h1 className="text-2xl font-bold">{title}</h1>
+            {onLogout && (
+                <button
+                    onClick={onLogout}
+                    className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-full shadow-lg transition duration-300 ease-in-out"
+                >
+                    Cerrar Sesión
+                </button>
+            )}
+        </header>
+    );
+};
+
+// Componente de navegación (simulado para una aplicación de una sola página)
+const NavBar = ({ setCurrentView, currentView, userRole }) => {
+    // Definición de los elementos de navegación y los roles asociados
+    const navItems = [
+        { name: 'Puntos de Recolección', view: 'publicHome', roles: ['Usuario Público'] },
+        { name: 'Catálogo', view: 'supplierCatalog', roles: ['Proveedor'] },
+        { name: 'Gestión de Teléfonos', view: 'warehousePhones', roles: ['Personal de Bodega'] },
+        { name: 'Desmantelamiento', view: 'disassembly', roles: ['Técnico de Desmantelamiento'] },
+        { name: 'Gestión de Inventario', view: 'adminInventory', roles: ['Administrador'] },
+        { name: 'Gestión de Pedidos', view: 'adminOrders', roles: ['Administrador'] },
+        { name: 'Gestión de Usuarios', view: 'adminUsers', roles: ['Administrador'] },
+        { name: 'Reportes', view: 'adminReports', roles: ['Administrador'] },
+        { name: 'Concientización', view: 'awarenessContent', roles: ['Usuario Público', 'Proveedor', 'Administrador'] },
+    ];
+
+    return (
+        <nav className="bg-gray-100 p-4 shadow-inner rounded-t-xl overflow-x-auto">
+            <div className="flex space-x-4 justify-center">
+                {navItems.map(item => {
+                    // Mostrar enlaces solo si el rol del usuario está incluido en los roles permitidos para el item
+                    if (item.roles.includes(userRole)) {
+                        return (
+                            <button
+                                key={item.view}
+                                onClick={() => setCurrentView(item.view)}
+                                className={`px-4 py-2 rounded-full font-medium transition duration-300 ease-in-out
+                                    ${currentView === item.view ? 'bg-blue-500 text-white shadow-md' : 'bg-white text-gray-700 hover:bg-gray-200'}`}
+                            >
+                                {item.name}
+                            </button>
+                        );
+                    }
+                    return null;
+                })}
+            </div>
+        </nav>
+    );
+};
+
+// Componente de la pantalla de inicio para Usuarios Públicos
+const PublicHomePage = ({ showMessage }) => {
+    const { db } = useContext(AuthContext);
+    const [collectionPoints, setCollectionPoints] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    // FIX: Define appId here
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+    useEffect(() => {
+        if (!db) return;
+
+        const q = query(collection(db, `/artifacts/${appId}/public/data/collectionPoints`));
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const points = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setCollectionPoints(points);
+            setLoading(false);
+        }, (err) => {
+            console.error("Error fetching collection points:", err);
+            setError("Error al cargar los puntos de recolección.");
+            showMessage("Error al cargar los puntos de recolección.", "error");
+            setLoading(false);
+        });
+
+        // FIX: Add appId to dependency array
+        return () => unsubscribe();
+    }, [db, showMessage, appId]);
+
+    if (loading) return <div className="text-center p-4">Cargando puntos de recolección...</div>;
+    if (error) return <div className="text-center p-4 text-red-600">{error}</div>;
+    if (collectionPoints.length === 0) return <div className="text-center p-4 text-gray-500">No hay puntos de recolección disponibles en este momento.</div>;
+
+    return (
+        <div className="p-4 bg-white rounded-lg shadow-md min-h-[calc(100vh-160px)] overflow-auto">
+            <h2 className="text-2xl font-semibold mb-4 text-gray-800">Mapa Interactivo de Puntos de Recolección</h2>
+            <p className="text-gray-600 mb-6">Encuentra el punto de recolección de RAEE más cercano a ti.</p>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {collectionPoints.map(point => (
+                    <div key={point.id} className="bg-gray-50 p-6 rounded-xl shadow-sm hover:shadow-md transition-shadow duration-300">
+                        <h3 className="text-xl font-bold text-blue-700 mb-2">{point.name}</h3>
+                        <p className="text-gray-700 mb-1"><strong>Dirección:</strong> {point.address}</p>
+                        <p className="text-gray-700 mb-1"><strong>Horario:</strong> {point.hours}</p>
+                        <p className="text-gray-700 mb-3"><strong>Contacto:</strong> {point.contact}</p>
+                        <a
+                            href={`https://maps.google.com/?q=${encodeURIComponent(point.address)}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center bg-blue-500 hover:bg-blue-600 text-white font-semibold py-2 px-4 rounded-full transition duration-300 ease-in-out shadow-lg"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor">
+                                <path fillRule="evenodd" d="M5.05 4.05a7 7 0 119.9 9.9L10 18.9l-4.95-4.95a7 7 0 010-9.9zM10 11a2 2 0 100-4 2 2 0 000 4z" clipRule="evenodd" />
+                            </svg>
+                            Ver en Mapa
+                        </a>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+// Componente del catálogo de componentes para Proveedores
+const SupplierCatalogPage = ({ showMessage }) => {
+    const { db } = useContext(AuthContext);
+    const [components, setComponents] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [searchTerm, setSearchTerm] = useState('');
+    const [filterCategory, setFilterCategory] = useState('all');
+    // FIX: Define appId here
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+    useEffect(() => {
+        if (!db) return;
+
+        const componentsColRef = collection(db, `/artifacts/${appId}/public/data/components`);
+        // Consulta para obtener solo los componentes vendibles
+        const q = query(componentsColRef, where('isSellable', '==', true));
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setComponents(items);
+            setLoading(false);
+        }, (err) => {
+            console.error("Error fetching components:", err);
+            setError("Error al cargar el catálogo de componentes.");
+            showMessage("Error al cargar el catálogo de componentes.", "error");
+            setLoading(false);
+        });
+
+        // FIX: Add appId to dependency array
+        return () => unsubscribe();
+    }, [db, showMessage, appId]);
+
+    // Filtrar componentes según el término de búsqueda y la categoría
+    const filteredComponents = components.filter(component => {
+        const matchesSearch = component.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                              component.model.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                              component.brand.toLowerCase().includes(searchTerm.toLowerCase());
+        const matchesCategory = filterCategory === 'all' || component.type === filterCategory;
+        return matchesSearch && matchesCategory;
+    });
+
+    if (loading) return <div className="text-center p-4">Cargando catálogo...</div>;
+    if (error) return <div className="text-center p-4 text-red-600">{error}</div>;
+
+    // Obtener categorías únicas para el filtro
+    const uniqueCategories = ['all', ...new Set(components.map(c => c.type))];
+
+    return (
+        <div className="p-4 bg-white rounded-lg shadow-md min-h-[calc(100vh-160px)] overflow-auto">
+            <h2 className="text-2xl font-semibold mb-4 text-gray-800">Catálogo de Componentes IARecycla</h2>
+            <div className="mb-6 flex flex-col sm:flex-row gap-4">
+                <input
+                    type="text"
+                    placeholder="Buscar por nombre, modelo o marca..."
+                    className="p-3 border border-gray-300 rounded-lg flex-grow shadow-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent"
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                />
+                <select
+                    className="p-3 border border-gray-300 rounded-lg shadow-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent"
+                    value={filterCategory}
+                    onChange={(e) => setFilterCategory(e.target.value)}
+                >
+                    {uniqueCategories.map(category => (
+                        <option key={category} value={category}>
+                            {category === 'all' ? 'Todas las Categorías' : category.charAt(0).toUpperCase() + category.slice(1)}
+                        </option>
+                    ))}
+                </select>
+            </div>
+            {filteredComponents.length === 0 ? (
+                <div className="text-center p-4 text-gray-500">No se encontraron componentes que coincidan con la búsqueda.</div>
+            ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {filteredComponents.map(component => (
+                        <div key={component.id} className="bg-gray-50 p-6 rounded-xl shadow-sm hover:shadow-lg transition-shadow duration-300 border border-gray-200">
+                            <h3 className="text-xl font-bold text-blue-700 mb-2">{component.name}</h3>
+                            <p className="text-gray-700 mb-1"><strong>Marca:</strong> {component.brand}</p>
+                            <p className="text-gray-700 mb-1"><strong>Modelo:</strong> {component.model}</p>
+                            <p className="text-gray-700 mb-1"><strong>Tipo:</strong> {component.type}</p>
+                            <p className="text-gray-700 mb-1"><strong>Condición:</strong> {component.condition}</p>
+                            <p className="text-green-600 text-lg font-semibold mt-3">Precio: ${component.price.toFixed(2)} CLP</p>
+                            <button
+                                onClick={() => showMessage(`Componente "${component.name}" añadido al carrito! (Funcionalidad de pedido no implementada)`, 'info')}
+                                className="mt-4 w-full bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-full shadow-lg transition duration-300 ease-in-out"
+                            >
+                                Añadir al Carrito
+                            </button>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+};
+
+// Componente para Contenido de Concientización
+const AwarenessContentPage = ({ showMessage }) => {
+    const { db, currentUser } = useContext(AuthContext);
+    const [content, setContent] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+    // Estados para la generación de contenido con Gemini
+    const [generationTopic, setGenerationTopic] = useState('');
+    const [generatedText, setGeneratedText] = useState('');
+    const [isGenerating, setIsGenerating] = useState(false);
+
+    // Permite generar contenido solo si el rol es Administrador
+    const canGenerateContent = currentUser?.role === 'Administrador';
+
+    useEffect(() => {
+        if (!db) return;
+
+        const q = query(collection(db, `/artifacts/${appId}/public/data/awarenessContent`));
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setContent(items);
+            setLoading(false);
+        }, (err) => {
+            console.error("Error fetching awareness content:", err);
+            setError("Error al cargar el contenido de concientización.");
+            showMessage("Error al cargar el contenido de concientización.", "error");
+            setLoading(false);
+        });
+
+        // FIX: Add appId to dependency array
+        return () => unsubscribe();
+    }, [db, showMessage, appId]);
+
+    // Función para llamar a la API de Gemini y generar contenido
+    const generateAwarenessContent = async () => {
+        if (!generationTopic.trim()) {
+            showMessage("Por favor, introduce un tema para generar contenido.", "error");
+            return;
+        }
+
+        setIsGenerating(true);
+        setGeneratedText(''); // Limpiar texto anterior
+        showMessage("Generando contenido con IA...", "info", 5000);
+
+        try {
+            const prompt = `Genera un artículo corto (aproximadamente 200-300 palabras) sobre el tema: "${generationTopic}". Enfócate en la importancia del reciclaje electrónico y cómo IARecycla contribuye a ello en Chile.`;
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+            const payload = { contents: chatHistory };
+            const apiKey = ""; // La clave API se inyectará automáticamente en el entorno de Canvas
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+
+            if (result.candidates && result.candidates.length > 0 &&
+                result.candidates[0].content && result.candidates[0].content.parts &&
+                result.candidates[0].content.parts.length > 0) {
+                const text = result.candidates[0].content.parts[0].text;
+                setGeneratedText(text);
+                showMessage("Contenido generado con éxito.", "success");
+            } else {
+                setGeneratedText("No se pudo generar contenido. Intenta con otro tema.");
+                showMessage("Error al generar contenido con IA.", "error");
+                console.error("Respuesta inesperada de Gemini API:", result);
+            }
+        } catch (err) {
+            console.error("Error al llamar a Gemini API:", err);
+            setGeneratedText("Hubo un error al conectar con el servicio de IA.");
+            showMessage("Error en la conexión con la IA.", "error");
+        } finally {
+            setIsGenerating(false);
+        }
+    };
+
+    // Función para guardar el contenido generado en Firestore
+    const saveGeneratedContent = async () => {
+        if (!generatedText.trim()) {
+            showMessage("No hay contenido generado para guardar.", "error");
+            return;
+        }
+        if (!db) {
+            showMessage("Base de datos no disponible.", "error");
+            return;
+        }
+
+        try {
+            await addDoc(collection(db, `/artifacts/${appId}/public/data/awarenessContent`), {
+                title: `Contenido AI: ${generationTopic || 'Sin Título'}`,
+                description: generatedText.substring(0, 150) + '...', // Breve descripción
+                articleUrl: '', // No hay URL externa para el contenido generado
+                imageUrl: `https://placehold.co/400x200/4CAF50/FFFFFF?text=IA+Recycla`, // Imagen de placeholder
+                createdAt: new Date().toISOString()
+            });
+            showMessage("Contenido generado y guardado con éxito.", "success");
+            setGeneratedText('');
+            setGenerationTopic('');
+        } catch (err) {
+            console.error("Error al guardar el contenido generado:", err);
+            showMessage("Error al guardar el contenido generado.", "error");
+        }
+    };
+
+    if (loading) return <div className="text-center p-4">Cargando contenido de concientización...</div>;
+    if (error) return <div className="text-center p-4 text-red-600">{error}</div>;
+
+    return (
+        <div className="p-4 bg-white rounded-lg shadow-md min-h-[calc(100vh-160px)] overflow-auto">
+            <h2 className="text-2xl font-semibold mb-4 text-gray-800">Contenido de Concientización sobre Reciclaje Electrónico</h2>
+            <p className="text-gray-600 mb-6">Infórmate sobre la importancia de reciclar tus dispositivos electrónicos y el impacto de IARecycla.</p>
+            
+            {/* Sección para Generar Contenido con IA (solo visible para Administradores) */}
+            {canGenerateContent && (
+                <div className="mb-8 p-6 bg-purple-50 rounded-xl shadow-inner border border-purple-200">
+                    <h3 className="text-xl font-bold mb-4 text-purple-800">Generar Nuevo Contenido de Concientización ✨</h3>
+                    <div className="mb-4">
+                        <label htmlFor="generationTopic" className="block text-gray-700 text-sm font-bold mb-2">
+                            Tema del Contenido:
+                        </label>
+                        <input
+                            type="text"
+                            id="generationTopic"
+                            placeholder="Ej: Beneficios del reciclaje de baterías de móvil"
+                            className="p-3 border border-gray-300 rounded-lg w-full shadow-sm focus:ring-2 focus:ring-purple-400 focus:border-transparent"
+                            value={generationTopic}
+                            onChange={(e) => setGenerationTopic(e.target.value)}
+                            disabled={isGenerating}
+                        />
+                    </div>
+                    <button
+                        onClick={generateAwarenessContent}
+                        className="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-4 rounded-full shadow-lg transition duration-300 ease-in-out flex items-center justify-center"
+                        disabled={isGenerating}
+                    >
+                        {isGenerating ? (
+                            <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        ) : 'Generar Contenido ✨'}
+                    </button>
+
+                    {generatedText && (
+                        <div className="mt-6 p-4 bg-purple-100 rounded-lg border border-purple-300">
+                            <h4 className="text-lg font-bold mb-2 text-purple-800">Contenido Generado:</h4>
+                            <textarea
+                                className="w-full h-40 p-2 border border-gray-300 rounded-lg text-gray-800 resize-y"
+                                value={generatedText}
+                                onChange={(e) => setGeneratedText(e.target.value)}
+                            />
+                            <div className="flex justify-end gap-2 mt-4">
+                                <button
+                                    onClick={saveGeneratedContent}
+                                    className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-full shadow-lg transition duration-300 ease-in-out"
+                                >
+                                    Guardar Contenido
+                                </button>
+                                <button
+                                    onClick={() => setGeneratedText('')}
+                                    className="bg-gray-400 hover:bg-gray-500 text-white font-bold py-2 px-4 rounded-full shadow-lg transition duration-300 ease-in-out"
+                                >
+                                    Limpiar
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {/* Contenido de concientización existente */}
+            {content.length === 0 ? (
+                <div className="text-center p-4 text-gray-500">No hay contenido de concientización disponible en este momento.</div>
+            ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {content.map(item => (
+                        <div key={item.id} className="bg-gray-50 p-6 rounded-xl shadow-sm hover:shadow-md transition-shadow duration-300">
+                            <h3 className="text-xl font-bold text-blue-700 mb-2">{item.title}</h3>
+                            <p className="text-gray-700 mb-4">{item.description}</p>
+                            {item.imageUrl && (
+                                <img src={item.imageUrl} alt={item.title} className="w-full h-40 object-cover rounded-md mb-4" onError={(e) => { e.target.onerror = null; e.target.src = `https://placehold.co/400x200/cccccc/333333?text=Sin+Imagen`; }} />
+                            )}
+                            {item.articleUrl && (
+                                <a
+                                    href={item.articleUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center bg-blue-500 hover:bg-blue-600 text-white font-semibold py-2 px-4 rounded-full transition duration-300 ease-in-out shadow-lg"
+                                >
+                                    Leer Más
+                                </a>
+                            )}
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+};
+
+// Componente para la gestión de teléfonos (Personal de Bodega)
+const WarehousePhonesPage = ({ showMessage }) => {
+    const { db, userId } = useContext(AuthContext);
+    const [phones, setPhones] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [newPhone, setNewPhone] = useState({ brand: '', model: '', quantity: '', origin: '' });
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+    useEffect(() => {
+        if (!db || !userId) return;
+
+        // Consulta para obtener teléfonos de la colección privada del usuario
+        const q = query(collection(db, `/artifacts/${appId}/users/${userId}/phonesToDismantle`));
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setPhones(items);
+            setLoading(false);
+        }, (err) => {
+            console.error("Error fetching phones for warehouse:", err);
+            setError("Error al cargar teléfonos.");
+            showMessage("Error al cargar teléfonos.", "error");
+            setLoading(false);
+        });
+
+        return () => unsubscribe();
+    }, [db, userId, showMessage, appId]);
+
+    // Manejar el envío del formulario para añadir un nuevo teléfono
+    const handleAddPhone = async (e) => {
+        e.preventDefault();
+        if (!db || !userId) {
+            showMessage("Error: Usuario no autenticado o base de datos no disponible.", "error");
+            return;
+        }
+        if (!newPhone.brand || !newPhone.model || !newPhone.quantity || !newPhone.origin) {
+            showMessage("Por favor, rellena todos los campos para añadir un teléfono.", "error");
+            return;
+        }
+
+        try {
+            await addDoc(collection(db, `/artifacts/${appId}/users/${userId}/phonesToDismantle`), {
+                ...newPhone,
+                quantity: parseInt(newPhone.quantity),
+                receivedDate: new Date().toISOString(), // Fecha de recepción
+                status: 'pending_dismantling' // Estado inicial del teléfono
+            });
+            showMessage("Teléfono registrado con éxito.", "success");
+            setNewPhone({ brand: '', model: '', quantity: '', origin: '' }); // Limpiar formulario
+        } catch (err) {
+            console.error("Error adding phone:", err);
+            showMessage("Error al registrar el teléfono.", "error");
+        }
+    };
+
+    // Manejar la eliminación de un teléfono
+    const handleDeletePhone = async (id) => {
+        if (!db || !userId) {
+            showMessage("Error: Usuario no autenticado o base de datos no disponible.", "error");
+            return;
+        }
+        try {
+            await deleteDoc(doc(db, `/artifacts/${appId}/users/${userId}/phonesToDismantle`, id));
+            showMessage("Teléfono eliminado con éxito.", "success");
+        } catch (err) {
+            console.error("Error deleting phone:", err);
+            showMessage("Error al eliminar el teléfono.", "error");
+        }
+    };
+
+    if (loading) return <div className="text-center p-4">Cargando gestión de teléfonos...</div>;
+    if (error) return <div className="text-center p-4 text-red-600">{error}</div>;
+
+    return (
+        <div className="p-4 bg-white rounded-lg shadow-md min-h-[calc(100vh-160px)] overflow-auto">
+            <h2 className="text-2xl font-semibold mb-4 text-gray-800">Gestión de Teléfonos en Bodega</h2>
+
+            <form onSubmit={handleAddPhone} className="mb-8 p-6 bg-blue-50 rounded-xl shadow-inner">
+                <h3 className="text-xl font-bold mb-4 text-blue-800">Registrar Nuevo Teléfono Recibido</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                    <input
+                        type="text"
+                        placeholder="Marca (ej. Samsung)"
+                        className="p-3 border border-gray-300 rounded-lg shadow-sm"
+                        value={newPhone.brand}
+                        onChange={(e) => setNewPhone({ ...newPhone, brand: e.target.value })}
+                        required
+                    />
+                    <input
+                        type="text"
+                        placeholder="Modelo (ej. Galaxy S21)"
+                        className="p-3 border border-gray-300 rounded-lg shadow-sm"
+                        value={newPhone.model}
+                        onChange={(e) => setNewPhone({ ...newPhone, model: e.target.value })}
+                        required
+                    />
+                    <input
+                        type="number"
+                        placeholder="Cantidad"
+                        className="p-3 border border-gray-300 rounded-lg shadow-sm"
+                        value={newPhone.quantity}
+                        onChange={(e) => setNewPhone({ ...newPhone, quantity: e.target.value })}
+                        min="1"
+                        required
+                    />
+                    <input
+                        type="text"
+                        placeholder="Origen (Punto de Recolección)"
+                        className="p-3 border border-gray-300 rounded-lg shadow-sm"
+                        value={newPhone.origin}
+                        onChange={(e) => setNewPhone({ ...newPhone, origin: e.target.value })}
+                        required
+                    />
+                </div>
+                <button
+                    type="submit"
+                    className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-full shadow-lg transition duration-300 ease-in-out"
+                >
+                    Añadir Teléfono al Inventario
+                </button>
+            </form>
+
+            <h3 className="text-xl font-bold mb-4 text-gray-800">Teléfonos Pendientes de Desmantelamiento</h3>
+            {phones.length === 0 ? (
+                <div className="text-center p-4 text-gray-500">No hay teléfonos pendientes de desmantelamiento.</div>
+            ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    {phones.map(phone => (
+                        <div key={phone.id} className="bg-gray-50 p-6 rounded-xl shadow-sm border border-gray-200">
+                            <h4 className="text-lg font-bold text-gray-800 mb-2">{phone.brand} {phone.model}</h4>
+                            <p className="text-gray-700"><strong>Cantidad:</strong> {phone.quantity}</p>
+                            <p className="text-gray-700"><strong>Origen:</strong> {phone.origin}</p>
+                            <p className="text-gray-700"><strong>Fecha Recibido:</strong> {new Date(phone.receivedDate).toLocaleDateString()}</p>
+                            <p className="text-gray-700"><strong>Estado:</strong> {phone.status === 'pending_dismantling' ? 'Pendiente Desmantelamiento' : phone.status}</p>
+                            <button
+                                onClick={() => handleDeletePhone(phone.id)}
+                                className="mt-4 bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-full shadow-lg transition duration-300 ease-in-out"
+                            >
+                                Eliminar
+                            </button>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+};
+
+// Componente para la gestión de desmantelamiento (Técnico de Desmantelamiento)
+const DisassemblyPage = ({ showMessage }) => {
+    const { db, userId } = useContext(AuthContext);
+    const [phonesToDismantle, setPhonesToDismantle] = useState([]);
+    const [selectedPhone, setSelectedPhone] = useState(null);
+    const [newComponent, setNewComponent] = useState({ name: '', type: '', brand: '', model: '', condition: 'funcional', price: 0 });
+    const [chatarraQuantity, setChatarraQuantity] = useState(0);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+
+    useEffect(() => {
+        if (!db || !userId) return;
+
+        // Consulta para obtener teléfonos con estado 'pending_dismantling' de la colección privada
+        const q = query(collection(db, `/artifacts/${appId}/users/${userId}/phonesToDismantle`), where('status', '==', 'pending_dismantling'));
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setPhonesToDismantle(items);
+            setLoading(false);
+        }, (err) => {
+            console.error("Error fetching phones for disassembly:", err);
+            setError("Error al cargar teléfonos para desmantelar.");
+            showMessage("Error al cargar teléfonos para desmantelar.", "error");
+            setLoading(false);
+        });
+
+        return () => unsubscribe();
+    }, [db, userId, showMessage, appId]);
+
+    // Manejar el proceso de desmantelamiento de un teléfono
+    const handleDismantlePhone = async () => {
+        if (!selectedPhone) {
+            showMessage("Por favor, selecciona un teléfono para desmantelar.", "error");
+            return;
+        }
+        if (!db || !userId) {
+            showMessage("Error: Usuario no autenticado o base de datos no disponible.", "error");
+            return;
+        }
+
+        try {
+            // Actualizar el estado del teléfono a "desmantelado" en la colección privada
+            await updateDoc(doc(db, `/artifacts/${appId}/users/${userId}/phonesToDismantle`, selectedPhone.id), {
+                status: 'dismantled',
+                dismantledDate: new Date().toISOString()
+            });
+
+            // Registrar la chatarra (si la cantidad es mayor que 0) en una colección privada
+            if (chatarraQuantity > 0) {
+                await addDoc(collection(db, `/artifacts/${appId}/users/${userId}/chatarra`), {
+                    phoneId: selectedPhone.id,
+                    quantity: chatarraQuantity,
+                    registeredDate: new Date().toISOString()
+                });
+            }
+
+            showMessage(`Teléfono ${selectedPhone.brand} ${selectedPhone.model} desmantelado con éxito.`, "success");
+            setSelectedPhone(null); // Limpiar la selección
+            setChatarraQuantity(0); // Reiniciar la cantidad de chatarra
+        } catch (err) {
+            console.error("Error dismantling phone:", err);
+            showMessage("Error al desmantelar el teléfono.", "error");
+        }
+    };
+
+    // Manejar el envío del formulario para añadir un nuevo componente
+    const handleAddComponent = async (e) => {
+        e.preventDefault();
+        if (!selectedPhone) {
+            showMessage("Primero selecciona un teléfono para asociar el componente.", "error");
+            return;
+        }
+        if (!db || !userId) {
+            showMessage("Error: Usuario no autenticado o base de datos no disponible.", "error");
+            return;
+        }
+        if (!newComponent.name || !newComponent.type || !newComponent.brand || !newComponent.model || !newComponent.price) {
+            showMessage("Por favor, rellena todos los campos del componente.", "error");
+            return;
+        }
+
+        try {
+            // Añadir el componente a la colección pública de componentes
+            await addDoc(collection(db, `/artifacts/${appId}/public/data/components`), {
+                ...newComponent,
+                price: parseFloat(newComponent.price),
+                phoneId: selectedPhone.id, // Asociar con el teléfono desmantelado
+                isSellable: true, // Marcar como vendible por defecto
+                registeredDate: new Date().toISOString()
+            });
+            showMessage("Componente registrado con éxito.", "success");
+            setNewComponent({ name: '', type: '', brand: '', model: '', condition: 'funcional', price: 0 }); // Limpiar formulario
+        } catch (err) {
+            console.error("Error adding component:", err);
+            showMessage("Error al registrar el componente.", "error");
+        }
+    };
+
+    if (loading) return <div className="text-center p-4">Cargando página de desmantelamiento...</div>;
+    if (error) return <div className="text-center p-4 text-red-600">{error}</div>;
+
+    return (
+        <div className="p-4 bg-white rounded-lg shadow-md min-h-[calc(100vh-160px)] overflow-auto">
+            <h2 className="text-2xl font-semibold mb-4 text-gray-800">Proceso de Desmantelamiento y Registro de Componentes</h2>
+
+            <div className="mb-6">
+                <h3 className="text-xl font-bold mb-3 text-blue-800">Seleccionar Teléfono para Desmantelar</h3>
+                {phonesToDismantle.length === 0 ? (
+                    <p className="text-gray-500">No hay teléfonos pendientes de desmantelamiento.</p>
+                ) : (
+                    <select
+                        className="p-3 border border-gray-300 rounded-lg w-full shadow-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent"
+                        onChange={(e) => setSelectedPhone(phonesToDismantle.find(p => p.id === e.target.value))}
+                        value={selectedPhone ? selectedPhone.id : ''}
+                    >
+                        <option value="">-- Selecciona un teléfono --</option>
+                        {phonesToDismantle.map(phone => (
+                            <option key={phone.id} value={phone.id}>
+                                {phone.brand} {phone.model} (Cantidad: {phone.quantity})
+                            </option>
+                        ))}
+                    </select>
+                )}
+            </div>
+
+            {selectedPhone && (
+                <div className="p-6 bg-green-50 rounded-xl shadow-inner mb-8">
+                    <h3 className="text-xl font-bold mb-4 text-green-800">Desmantelando: {selectedPhone.brand} {selectedPhone.model}</h3>
+                    <div className="mb-4">
+                        <label htmlFor="chatarraQuantity" className="block text-gray-700 text-sm font-bold mb-2">
+                            Cantidad de Chatarra (kg):
+                        </label>
+                        <input
+                            type="number"
+                            id="chatarraQuantity"
+                            className="p-3 border border-gray-300 rounded-lg w-full shadow-sm"
+                            value={chatarraQuantity}
+                            onChange={(e) => setChatarraQuantity(parseFloat(e.target.value))}
+                            min="0"
+                        />
+                    </div>
+                    <button
+                        onClick={handleDismantlePhone}
+                        className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-full shadow-lg transition duration-300 ease-in-out"
+                    >
+                        Completar Desmantelamiento y Registrar Chatarra
+                    </button>
+                </div>
+            )}
+
+            <form onSubmit={handleAddComponent} className="p-6 bg-blue-50 rounded-xl shadow-inner">
+                <h3 className="text-xl font-bold mb-4 text-blue-800">Registrar Componente Recuperado</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                    <input
+                        type="text"
+                        placeholder="Nombre del Componente (ej. Pantalla AMOLED)"
+                        className="p-3 border border-gray-300 rounded-lg shadow-sm"
+                        value={newComponent.name}
+                        onChange={(e) => setNewComponent({ ...newComponent, name: e.target.value })}
+                        required
+                    />
+                    <select
+                        className="p-3 border border-gray-300 rounded-lg shadow-sm"
+                        value={newComponent.type}
+                        onChange={(e) => setNewComponent({ ...newComponent, type: e.target.value })}
+                        required
+                    >
+                        <option value="">-- Selecciona Tipo --</option>
+                        <option value="pantalla">Pantalla</option>
+                        <option value="bateria">Batería</option>
+                        <option value="placa_madre">Placa Madre</option>
+                        <option value="carcasa">Carcasa</option>
+                        <option value="otro">Otro</option>
+                    </select>
+                    <input
+                        type="text"
+                        placeholder="Marca del Componente"
+                        className="p-3 border border-gray-300 rounded-lg shadow-sm"
+                        value={newComponent.brand}
+                        onChange={(e) => setNewComponent({ ...newComponent, brand: e.target.value })}
+                        required
+                    />
+                    <input
+                        type="text"
+                        placeholder="Modelo Compatible (ej. iPhone 12)"
+                        className="p-3 border border-gray-300 rounded-lg shadow-sm"
+                        value={newComponent.model}
+                        onChange={(e) => setNewComponent({ ...newComponent, model: e.target.value })}
+                        required
+                    />
+                    <select
+                        className="p-3 border border-gray-300 rounded-lg shadow-sm"
+                        value={newComponent.condition}
+                        onChange={(e) => setNewComponent({ ...newComponent, condition: e.target.value })}
+                        required
+                    >
+                        <option value="funcional">Funcional</option>
+                        <option value="reacondicionado">Reacondicionado</option>
+                        <option value="defectuoso">Defectuoso (No Vendible)</option>
+                    </select>
+                    <input
+                        type="number"
+                        placeholder="Precio (CLP)"
+                        className="p-3 border border-gray-300 rounded-lg shadow-sm"
+                        value={newComponent.price}
+                        onChange={(e) => setNewComponent({ ...newComponent, price: e.target.value })}
+                        min="0"
+                        step="0.01"
+                        required
+                    />
+                </div>
+                <button
+                    type="submit"
+                    className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-full shadow-lg transition duration-300 ease-in-out"
+                    disabled={!selectedPhone} // Deshabilitar el botón si no hay teléfono seleccionado
+                >
+                    Registrar Componente
+                </button>
+                {!selectedPhone && <p className="text-red-500 text-center mt-2">Por favor, selecciona un teléfono antes de registrar un componente.</p>}
+            </form>
+        </div>
+    );
+};
+
+// Componente principal de la aplicación
+const App = () => {
+    const [currentView, setCurrentView] = useState('publicHome'); // Vista inicial de la aplicación
+    const [userRole, setUserRole] = useState('Usuario Público'); // Estado para el rol del usuario, por defecto
+    const { currentUser, userId, loadingAuth, authError, logout } = useContext(AuthContext);
+    const { message, messageType, showMessage, clearMessage } = useAppMessage();
+
+    // Mostrar un mensaje de carga mientras se autentica Firebase
+    if (loadingAuth) {
+        return (
+            <div className="min-h-screen flex items-center justify-center bg-gray-100 p-4">
+                <div className="text-center text-blue-600 text-xl font-semibold">Cargando autenticación...</div>
+            </div>
+        );
+    }
+
+    // Mostrar un mensaje de error si la autenticación falla
+    if (authError) {
+        return (
+            <div className="min-h-screen flex items-center justify-center bg-red-100 p-4">
+                <div className="text-center text-red-700 text-xl font-semibold">
+                    Error de autenticación: {authError}
+                </div>
+            </div>
+        );
+    }
+
+    // Función para renderizar el contenido de la vista actual
+    const renderContent = () => {
+        switch (currentView) {
+            case 'publicHome':
+                return <PublicHomePage showMessage={showMessage} />;
+            case 'supplierCatalog':
+                return <SupplierCatalogPage showMessage={showMessage} />;
+            case 'awarenessContent':
+                return <AwarenessContentPage showMessage={showMessage} />;
+            case 'warehousePhones':
+                return <WarehousePhonesPage showMessage={showMessage} />;
+            case 'disassembly':
+                return <DisassemblyPage showMessage={showMessage} />;
+            // Estas son las vistas de administración, no implementadas en esta demo
+            case 'adminInventory':
+            case 'adminOrders':
+            case 'adminUsers':
+            case 'adminReports':
+                return <div className="p-4 text-center text-gray-700">Funcionalidad de "{currentView.replace('admin', 'Administración de ').replace('supplier', 'Proveedor ')}" no implementada en esta demo.</div>;
+            default:
+                return <PublicHomePage showMessage={showMessage} />;
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-gray-100 font-sans text-gray-900 flex flex-col">
+            <Header title="IARecycla" onLogout={logout} />
+            {/* Selector de rol añadido aquí */}
+            <div className="p-4 bg-gray-200 shadow-md flex flex-col sm:flex-row items-center justify-center gap-4 rounded-t-xl">
+                <label htmlFor="role-selector" className="font-semibold text-gray-700">Ver como:</label>
+                <select
+                    id="role-selector"
+                    className="p-2 border border-gray-300 rounded-lg shadow-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent"
+                    value={userRole}
+                    onChange={(e) => setUserRole(e.target.value)}
+                >
+                    <option value="Usuario Público">Usuario Público</option>
+                    <option value="Proveedor">Proveedor</option>
+                    <option value="Personal de Bodega">Personal de Bodega</option>
+                    <option value="Técnico de Desmantelamiento">Técnico de Desmantelamiento</option>
+                    <option value="Administrador">Administrador</option>
+                </select>
+                {userId && <span className="text-sm text-gray-500">ID de Usuario: {userId}</span>}
+            </div>
+            <NavBar setCurrentView={setCurrentView} currentView={currentView} userRole={userRole} />
+            <main className="flex-grow p-4">
+                {renderContent()}
+            </main>
+            <AppMessage message={message} type={messageType} onClose={clearMessage} />
+            <footer className="bg-gray-800 text-white p-4 text-center text-sm rounded-t-xl">
+                © {new Date().getFullYear()} IARecycla. Todos los derechos reservados.
+            </footer>
+        </div>
+    );
+};
+
+// Wrapper para proporcionar el AuthContext a toda la aplicación
+export default function AppWrapper() {
+    return (
+        <AuthProvider>
+            <App />
+        </AuthProvider>
+    );
+}
